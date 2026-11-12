@@ -13,14 +13,15 @@ def test_db_operations_from_thread(tmp_path, monkeypatch):
     db_path = str(tmp_path / "thread.db")
     monkeypatch.setattr(db, "DB_PATH", db_path)
     monkeypatch.setattr(focus_db, "DB_PATH", db_path)
-    c = db.conn(db_path)
     errors = []
+    result = {}
 
     def worker():
         try:
-            nid = db.add_notification(c, "Slack", "Tester", "hello from thread", "work", 0.5)
+            nid = db.add_notification("Slack", "Tester", "hello from thread", "work", 0.5)
             hid = focus_db.add_held("Slack", "held from thread", "work", 0.4, mode="Study")
-            worker.result = (nid, hid)
+            result["nid"] = nid
+            result["hid"] = hid
         except Exception as e:
             errors.append(e)
 
@@ -29,9 +30,9 @@ def test_db_operations_from_thread(tmp_path, monkeypatch):
     t.join()
 
     assert not errors
-    nid, hid = worker.result
-    row = c.execute("SELECT id, text FROM notifications WHERE id=?", (nid,)).fetchone()
+    nid, hid = result["nid"], result["hid"]
+    with db.get_conn() as c:
+        row = c.execute("SELECT id, text FROM notifications WHERE id=?", (nid,)).fetchone()
     assert row is not None and row["text"] == "hello from thread"
     held = focus_db.get_held(hid)
     assert held is not None and held["text"] == "held from thread"
-    c.close()

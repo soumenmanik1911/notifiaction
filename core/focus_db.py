@@ -49,6 +49,8 @@ def conn(path=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     c = sqlite3.connect(path, check_same_thread=False, timeout=10)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA busy_timeout=5000;")
     c.executescript(SCHEMA)
     _ensure_columns(c)
     return c

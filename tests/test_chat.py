@@ -40,13 +40,11 @@ def test_reply_empty_db_includes_daytime_without_crashing(tmp_path, monkeypatch)
 
 def test_reply_populated_data(tmp_path, monkeypatch):
     _use_tmp_db(tmp_path, monkeypatch)
-    c = db.conn()
     now = datetime(2026, 11, 12, 10, 30, 0)
-    nid = db.add_notification(c, "Slack", "lead", "send the report", "work", 0.8, ts=now)
-    db.add_notification(c, "Gmail", "mom", "call me when free", "family", 0.2, ts=now)
-    db.add_reminder(c, nid, now, "follow up on report")
-    db.log_choice(c, nid, "work", "Slack", now, 0.8, "1h", "user")
-    c.close()
+    nid = db.add_notification("Slack", "lead", "send the report", "work", 0.8, ts=now)
+    db.add_notification("Gmail", "mom", "call me when free", "family", 0.2, ts=now)
+    db.add_reminder(nid, now, "follow up on report")
+    db.log_choice(nid, "work", "Slack", now, 0.8, "1h", "user")
     focus_db.add_held("Slack", "held msg", "work", 0.4, created_at=now, mode="Study")
 
     r1 = generate_reply("how many pending notifications", now=now)

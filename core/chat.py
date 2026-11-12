@@ -57,22 +57,18 @@ def _join_counts(counts):
 
 def _live_context(now):
     """Gather counts and breakdowns from the live databases."""
-    c = db.conn()
-    try:
-        pending_items = db.pending(c)
-        by_cat = {}
-        by_urg = {"High": 0, "Medium": 0, "Low": 0}
-        for n in pending_items:
-            cat = n["category"] or "uncategorized"
-            by_cat[cat] = by_cat.get(cat, 0) + 1
-            level = _urg_level(float(n["urgency"] or 0))
-            by_urg[level] = by_urg.get(level, 0) + 1
-        reminders = db.reminders(c)
-        n_rem = len(reminders)
-        n_due = sum(1 for r in reminders if datetime.fromisoformat(r["due_ts"]) <= now)
-        n_choices = len(db.user_choices_df(c))
-    finally:
-        c.close()
+    pending_items = db.pending()
+    by_cat = {}
+    by_urg = {"High": 0, "Medium": 0, "Low": 0}
+    for n in pending_items:
+        cat = n["category"] or "uncategorized"
+        by_cat[cat] = by_cat.get(cat, 0) + 1
+        level = _urg_level(float(n["urgency"] or 0))
+        by_urg[level] = by_urg.get(level, 0) + 1
+    reminders = db.reminders()
+    n_rem = len(reminders)
+    n_due = sum(1 for r in reminders if datetime.fromisoformat(r["due_ts"]) <= now)
+    n_choices = len(db.user_choices_df())
 
     held_items = focus_db.list_held(None)
     held_cats = {}
