@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS reminders(
 def conn(path=None):
     path = path or DB_PATH
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    c = sqlite3.connect(path)
+    c = sqlite3.connect(path, check_same_thread=False, timeout=10)
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
     return c

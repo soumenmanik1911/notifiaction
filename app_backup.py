@@ -87,18 +87,18 @@ with st.sidebar:
         text = st.text_input("Message", "Can you send me the document today?")
         app_name = st.text_input("App", "Slack")
         sender = st.text_input("Sender", "Manager")
-        if st.form_submit_button("Send", type="primary", use_container_width=True):
+        if st.form_submit_button("Send", type="primary", width="stretch"):
             cat, _ = cat_model.predict(text)
             db.add_notification(c, app_name, sender, text, cat, urgency_score(text))
             st.rerun()
-    if st.button("🎲 Random notification", use_container_width=True):
+    if st.button("🎲 Random notification", width="stretch"):
         _, a, t = random_notification()
         pc, _ = cat_model.predict(t)
         db.add_notification(c, a, "random", t, pc, urgency_score(t)); st.rerun()
     st.divider()
     st.markdown("### 🧪 Demo helpers")
     n_sim = st.slider("Simulated decisions", 20, 200, 60, 10)
-    if st.button("🤖 Train with simulated user", use_container_width=True):
+    if st.button("🤖 Train with simulated user", width="stretch"):
         for _ in range(n_sim):
             tc, a, t = random_notification()
             pc, _ = cat_model.predict(t)
@@ -107,7 +107,7 @@ with st.sidebar:
             db.log_choice(c, nid, pc, a, ts, u, persona_action(tc, ts.hour, u), "user")
             db.set_status(c, nid, "snoozed")
         st.rerun()
-    if st.button("🗑 Reset all data", use_container_width=True):
+    if st.button("🗑 Reset all data", width="stretch"):
         db.reset(c); st.rerun()
 
 tab1, tab2, tab3 = st.tabs(["📥 Inbox", "⏰ Reminders", "🧠 What it learned"])
@@ -135,9 +135,9 @@ with tab1:
         cols = st.columns(len(ACTIONS) + 1)
         for col, a in zip(cols, ACTIONS):
             if col.button(f"{ACTION_ICON[a]} {LABELS[a]}", key=f"{n['id']}_{a}",
-                          type="primary" if a == top else "secondary", use_container_width=True):
+                          type="primary" if a == top else "secondary", width="stretch"):
                 act(n, a)
-        if cols[-1].button("✨ Let AI decide", key=f"{n['id']}_ai", use_container_width=True):
+        if cols[-1].button("✨ Let AI decide", key=f"{n['id']}_ai", width="stretch"):
             act(n, top, source="ai")
 
 # ---------------- reminders ----------------
@@ -153,7 +153,7 @@ with tab2:
         a.markdown(f'<div class="card" style="margin-top:8px;border-left:5px solid {colr}">'
                    f'<span class="pill" style="color:{colr};background:#F6F4FF">{"🔴 Due now" if overdue else "🕒 " + due.strftime("%a %d %b, %H:%M")}</span>'
                    f'<div class="msg">{html.escape(r["text"])}</div></div>', unsafe_allow_html=True)
-        if b.button("✅ Done", key=f"done{r['id']}", use_container_width=True):
+        if b.button("✅ Done", key=f"done{r['id']}", width="stretch"):
             db.complete_reminder(c, r["id"]); st.rerun()
 
 # ---------------- insights ----------------
@@ -163,7 +163,7 @@ with tab3:
         st.info("Make some choices, or click 'Train with simulated user', to see patterns.")
     else:
         st.markdown("#### Your habits: category × action")
-        st.dataframe(pd.crosstab(df["category"], df["action"]), use_container_width=True)
+        st.dataframe(pd.crosstab(df["category"], df["action"]), width="stretch")
         st.markdown("#### Average hour you act on each category")
         st.bar_chart(df.groupby("category")["hour"].mean(), color="#6C5CE7")
         st.markdown("#### Try it: what would it suggest?")

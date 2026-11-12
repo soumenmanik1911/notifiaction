@@ -1,49 +1,29 @@
 """AI-Powered Notification Assistant - Streamlit UI.   Run:  python -m streamlit run app.py"""
 import html
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 
-from core import db
-from core.categorize import Categorizer, urgency_score
+from core import db, focus_db
+from core.categorize import CATEGORIES, Categorizer, urgency_score
+from core.focus import auto_mode, gate, MODES
 from core.recommend import Recommender
+from core.samples import next_sample
 from core.schedule import ACTIONS, LABELS, due_time
 from core.simulator import random_notification, persona_action, random_time
+from core.chat import generate_reply
+from ui.components import render_home
+from ui.styles import inject_css
 
-st.set_page_config(page_title="Notification Assistant", page_icon="🔔", layout="wide")
+st.set_page_config(page_title="Notification Assistant", page_icon="N", layout="wide")
+inject_css()
 
-CAT_STYLE = {  # emoji, text colour, background
+CAT_STYLE = {  # text colour, background
     "work": ("", "#2D5BFF", "#E6ECFF"), "family": ("", "#D6336C", "#FFE3EE"),
     "shopping": ("", "#E67700", "#FFF0D9"), "college": ("", "#7048E8", "#EEE6FF"),
     "finance": ("", "#0B8A5F", "#DDF6EA"), "social": ("", "#0C8599", "#DDF4F8"),
 }
 ACTION_ICON = {"1h": "", "tonight": "", "tomorrow": "", "important": "", "ignore": ""}
-
-st.markdown("""
-<style>
-.block-container {padding-top: 1.5rem; max-width: 1100px;}
-.hero {background:#E63946; border-radius: 20px; padding: 26px 30px; color: white; margin-bottom: 18px;
-       box-shadow: 0 8px 24px rgba(230,57,70,.28);}
-.hero h1 {margin:0; font-size: 2rem; color:white;}
-.hero p {margin:6px 0 0; opacity:.92; font-size:1rem;}
-.pill {display:inline-block; padding:4px 12px; border-radius:999px; font-size:.78rem;
-       font-weight:600; margin-right:6px;}
-.card {background:white; border-radius:16px; padding:18px 20px; margin-top:14px;
-       box-shadow: 0 2px 12px rgba(31,36,48,.07); border:1px solid #ECEEF5;}
-.card .msg {font-size:1.08rem; font-weight:600; color:#1F2430; margin:8px 0 4px;}
-.card .meta {color:#7A8194; font-size:.82rem;}
-.sugg {margin-top:12px; padding:12px 14px; background:#F6F4FF; border-radius:12px;
-       border:1px dashed #C9C0FA; color:#3B2FA0; font-size:.95rem;}
-.bar {height:6px; border-radius:6px; background:#E8E6F7; margin-top:4px; overflow:hidden;}
-.bar > div {height:100%; background:linear-gradient(90deg,#6C5CE7,#4DA3FF);}
-.stButton > button {border-radius:10px; font-weight:600; border:1px solid #DCDFF0;}
-.stButton > button:hover {border-color:#6C5CE7; color:#6C5CE7;}
-.stat {background:white; border-radius:14px; padding:14px 18px; border:1px solid #ECEEF5;
-       box-shadow:0 2px 8px rgba(31,36,48,.05);}
-.stat b {font-size:1.5rem; color:#6C5CE7;} .stat span {color:#7A8194; font-size:.82rem; display:block;}
-[data-testid="stSidebar"] {background:#FFFFFF; border-right:1px solid #ECEEF5;}
-</style>
-""", unsafe_allow_html=True)
 
 @st.cache_resource
 def get_categorizer():
@@ -53,9 +33,47 @@ c = db.conn()
 cat_model = get_categorizer()
 rec = Recommender().fit(db.user_choices_df(c))
 
+DURATION_OPTIONS = {
+    "30 min": 30,
+    "1 hr": 60,
+    "2 hr": 120,
+    "Until I turn off": None,
+}
+
+def _new_focus_session(mode, duration_label):
+    mins = DURATION_OPTIONS[duration_label]
+    now = datetime.now()
+    return {
+        "mode": mode,
+        "started_at": now.isoformat(timespec="seconds"),
+        "ends_at": (now + timedelta(minutes=mins)).isoformat(timespec="seconds") if mins else None,
+        "duration": duration_label,
+        "shown": 0,
+        "held": 0,
+        "silenced": 0,
+        "manual": True,
+    }
+
+def end_focus_session():
+    s = st.session_state.get("focus_session")
+    if s and s.get("mode") and s["mode"] != "Off":
+        focus_db.log_session(
+            s["mode"], s["started_at"], datetime.now().isoformat(timespec="seconds"),
+            s.get("shown", 0), s.get("held", 0), s.get("silenced", 0),
+        )
+        st.session_state["focus_summary"] = {
+            "mode": s["mode"],
+            "shown": s.get("shown", 0),
+            "held": s.get("held", 0),
+            "silenced": s.get("silenced", 0),
+        }
+        st.session_state["focus_review_held"] = len(focus_db.list_held())
+    st.session_state["focus_session"] = None
+    st.session_state["focus_mode_select"] = "Off"
+
 def badge(cat):
     e, fg, bg = CAT_STYLE.get(cat, ("", "#444", "#EEE"))
-    return f'<span class="pill" style="color:{fg};background:{bg}">{cat}</span>'
+    return f'<span class="pill" style="color:{fg};background:{bg}">{html.escape(str(cat))}</span>'
 
 def act(n, action, source="user"):
     now = datetime.now()
@@ -66,111 +84,409 @@ def act(n, action, source="user"):
     db.set_status(c, n["id"], "ignored" if action == "ignore" else "snoozed")
     st.rerun()
 
-# ---------------- hero ----------------
-mode = (f"Learning from {rec.n} of your choices · trust {rec.trust:.0%}" if rec.pipe
-        else f"Cold start · using starter rules ({rec.n}/12 choices to begin learning)")
-st.markdown(f'<div class="hero"><h1>Notification Assistant</h1>'
-            f'<p>Less interruption, without missing what matters.</p>'
-            f'<p style="margin-top:12px"><span class="pill" style="background:rgba(255,255,255,.22);color:white">{mode}</span></p></div>',
-            unsafe_allow_html=True)
+def process_incoming(app_name, sender, text):
+    cat, _ = cat_model.predict(text)
+    urg = urgency_score(text)
+    mode = st.session_state.get("focus_mode_select", "Off")
+    decision = gate(mode, cat, urg, source=app_name)
+    if decision == "SHOW":
+        db.add_notification(c, app_name, sender, text, cat, urg)
+        fs = st.session_state.get("focus_session")
+        if fs and fs.get("mode") == mode and mode != "Off":
+            fs["shown"] = fs.get("shown", 0) + 1
+        st.session_state["focus_notice"] = ("toast", '<div class="toast-notice show">Notification shown: sent to inbox.</div>')
+        return decision
+    if decision == "HOLD":
+        focus_db.add_held(app_name, text, cat, urg, mode=mode)
+        fs = st.session_state.get("focus_session")
+        if fs and fs.get("mode") == mode and mode != "Off":
+            fs["held"] = fs.get("held", 0) + 1
+        st.session_state["focus_notice"] = ("toast", '<div class="toast-notice hold">Notification held: queued until focus ends.</div>')
+        return decision
+    if decision == "SILENCE":
+        fs = st.session_state.get("focus_session")
+        if fs and fs.get("mode") == mode and mode != "Off":
+            fs["silenced"] = fs.get("silenced", 0) + 1
+        st.session_state["focus_notice"] = ("toast", '<div class="toast-notice silence">Notification silenced: logged only.</div>')
+        return decision
+    return decision
 
-n_pending = len(db.pending(c)); n_rem = len(db.reminders(c)); n_ch = len(db.user_choices_df(c))
-s1, s2, s3 = st.columns(3)
-s1.markdown(f'<div class="stat"><b>{n_pending}</b><span>Pending notifications</span></div>', unsafe_allow_html=True)
-s2.markdown(f'<div class="stat"><b>{n_rem}</b><span>Active reminders</span></div>', unsafe_allow_html=True)
-s3.markdown(f'<div class="stat"><b>{n_ch}</b><span>Choices learned from</span></div>', unsafe_allow_html=True)
+def init_state():
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Home"
+    if "focus_session" not in st.session_state:
+        st.session_state["focus_session"] = None
+    if "focus_summary" not in st.session_state:
+        st.session_state["focus_summary"] = None
+    if "focus_review_held" not in st.session_state:
+        st.session_state["focus_review_held"] = 0
+    if "goto_tab" not in st.session_state:
+        st.session_state["goto_tab"] = None
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+    if "show_held_review" not in st.session_state:
+        st.session_state["show_held_review"] = False
 
-# ---------------- sidebar ----------------
-with st.sidebar:
-    st.markdown("### Send a notification")
-    with st.form("new", clear_on_submit=False):
-        text = st.text_input("Message", "Can you send me the document today?")
-        app_name = st.text_input("App", "Slack")
-        sender = st.text_input("Sender", "Manager")
-        if st.form_submit_button("Send", type="primary", use_container_width=True):
-            cat, _ = cat_model.predict(text)
-            db.add_notification(c, app_name, sender, text, cat, urgency_score(text))
+def render_app():
+    # expire active timed session
+    fs = st.session_state.get("focus_session")
+    if fs and fs.get("ends_at"):
+        if datetime.now() >= datetime.fromisoformat(fs["ends_at"]):
+            end_focus_session()
+
+    mode_info = (f"Learning from {rec.n} of your choices · trust {rec.trust:.0%}" if rec.pipe
+            else f"Cold start · using starter rules ({rec.n}/12 choices to begin learning)")
+    st.markdown(f'<div class="hero"><h1>Notification Assistant</h1>'
+                f'<p>Less interruption, without missing what matters.</p>'
+                f'<p style="margin-top:12px"><span class="pill">{mode_info}</span></p></div>',
+                unsafe_allow_html=True)
+
+    if st.session_state.get("focus_summary"):
+        s = st.session_state["focus_summary"]
+        st.success(f"Focus summary ({s['mode']}): shown {s['shown']}, held {s['held']}, silenced {s['silenced']}.")
+        st.session_state["focus_summary"] = None
+
+    if st.session_state.get("focus_review_held", 0) > 0:
+        nheld = st.session_state["focus_review_held"]
+        c1, c2 = st.columns([4, 1])
+        c1.info(f"You have {nheld} held notifications.")
+        if c2.button("Review them", key="review_held_btn"):
+            st.session_state["show_held_review"] = True
+            st.session_state["focus_review_held"] = 0
             st.rerun()
-    if st.button("Random notification", use_container_width=True):
-        _, a, t = random_notification()
-        pc, _ = cat_model.predict(t)
-        db.add_notification(c, a, "random", t, pc, urgency_score(t)); st.rerun()
-    st.divider()
-    st.markdown("### Demo helpers")
-    n_sim = st.slider("Simulated decisions", 20, 200, 60, 10)
-    if st.button("Train with simulated user", use_container_width=True):
-        for _ in range(n_sim):
-            tc, a, t = random_notification()
-            pc, _ = cat_model.predict(t)
-            u, ts = urgency_score(t), random_time()
-            nid = db.add_notification(c, a, "sim", t, pc, u, ts)
-            db.log_choice(c, nid, pc, a, ts, u, persona_action(tc, ts.hour, u), "user")
-            db.set_status(c, nid, "snoozed")
+        else:
+            st.session_state["focus_review_held"] = 0
+
+    if st.session_state.get("show_held_review"):
+        st.markdown("### Held notifications")
+        held_items = focus_db.list_held()
+        if not held_items:
+            st.info("No held notifications.")
+        for h in held_items:
+            h = dict(h)
+            a, b1, b2 = st.columns([6, 1, 1])
+            a.markdown(f'<div class="card" style="margin-top:8px">'
+                       f'{badge(h.get("category",""))}'
+                       f'<span class="pill">{html.escape(str(h.get("source","")))}</span>'
+                       f'<div class="msg">{html.escape(str(h.get("text","")))}</div>'
+                       f'<div class="meta">urgency {float(h.get("urgency",0)):.2f} · {html.escape(str(h.get("created_at","")))}</div></div>',
+                       unsafe_allow_html=True)
+            if b1.button("Release", key=f"rrel{h['id']}", width="stretch"):
+                focus_db.record_release_signal(h["id"])
+                focus_db.set_held_status(h["id"], "released")
+                db.add_notification(c, h.get("source", "App"), "held", h.get("text", ""), h.get("category", "social"), float(h.get("urgency", 0)))
+                st.rerun()
+            if b2.button("Dismiss", key=f"rdis{h['id']}", width="stretch"):
+                focus_db.set_held_status(h["id"], "dismissed")
+                st.rerun()
+        if st.button("Close review", key="close_held_review"):
+            st.session_state["show_held_review"] = False
+            st.rerun()
+
+    notice = st.session_state.pop("focus_notice", None)
+    if notice:
+        kind, msg = notice
+        if kind == "info":
+            st.info(msg)
+        elif kind == "caption":
+            st.caption(msg)
+        elif kind == "toast":
+            st.markdown(msg, unsafe_allow_html=True)
+        else:
+            st.info(msg)
+
+    n_pending = len(db.pending(c)); n_rem = len(db.reminders(c)); n_ch = len(db.user_choices_df(c))
+    s1, s2, s3 = st.columns(3)
+    s1.markdown(f'<div class="stat"><b>{n_pending}</b><span>Pending notifications</span></div>', unsafe_allow_html=True)
+    s2.markdown(f'<div class="stat"><b>{n_rem}</b><span>Active reminders</span></div>', unsafe_allow_html=True)
+    s3.markdown(f'<div class="stat"><b>{n_ch}</b><span>Choices learned from</span></div>', unsafe_allow_html=True)
+
+    # ---------------- sidebar ----------------
+    with st.sidebar:
+        nav_home, nav_chat = st.columns(2)
+        with nav_home:
+            if st.button("Home", key="app_home_link", width="stretch"):
+                st.session_state["page"] = "Home"
+                st.rerun()
+        with nav_chat:
+            if st.button("Chat", key="app_chat_link", width="stretch"):
+                st.session_state["page"] = "Chat"
+                st.rerun()
+        st.markdown("### Focus mode")
+        mode_options = list(MODES.keys())
+        default_mode = auto_mode()
+        if "focus_mode_select" not in st.session_state:
+            st.session_state["focus_mode_select"] = default_mode
+        prev_mode = st.session_state["focus_mode_select"]
+        selected_mode = st.selectbox("Mode", mode_options, index=mode_options.index(st.session_state["focus_mode_select"]), key="focus_mode_widget")
+        st.session_state["focus_mode_select"] = selected_mode
+        duration_label = st.selectbox("Duration", list(DURATION_OPTIONS.keys()), index=3, key="focus_duration_widget")
+        if selected_mode != "Off" and (st.session_state.get("focus_session") is None or st.session_state.get("focus_session", {}).get("mode") != selected_mode or prev_mode != selected_mode):
+            st.session_state["focus_session"] = _new_focus_session(selected_mode, duration_label)
+        if selected_mode == "Off" and prev_mode != "Off":
+            end_focus_session()
+        # update duration end for active session if user changed duration
+        fs = st.session_state.get("focus_session")
+        if fs and fs.get("mode") == selected_mode and selected_mode != "Off":
+            mins = DURATION_OPTIONS[duration_label]
+            now = datetime.now()
+            fs["duration"] = duration_label
+            fs["ends_at"] = (now + timedelta(minutes=mins)).isoformat(timespec="seconds") if mins else None
+        st.caption(f"Auto suggestion now: {auto_mode()}")
+
+        st.markdown("### Send a notification")
+        if "sample_filter" not in st.session_state:
+            st.session_state["sample_filter"] = "Any"
+        if "send_warning" not in st.session_state:
+            st.session_state["send_warning"] = ""
+
+        def _sample_cat():
+            f = st.session_state.get("sample_filter", "Any")
+            return None if f == "Any" else f
+
+        def _load_sample():
+            last = st.session_state.get("current_sample")
+            s = next_sample(_sample_cat(), last)
+            st.session_state["current_sample"] = s
+            st.session_state["in_msg"] = s["message"] if s else ""
+            st.session_state["in_app"] = s["app"] if s else ""
+            st.session_state["in_sender"] = s["sender"] if s else ""
+
+        if "in_msg" not in st.session_state:
+            _load_sample()
+
+        def _send_current():
+            msg = (st.session_state.get("in_msg") or "").strip()
+            if not msg:
+                st.session_state["send_warning"] = "Message is empty."
+                return
+            st.session_state["send_warning"] = ""
+            app_n = st.session_state.get("in_app", "")
+            snd = st.session_state.get("in_sender", "")
+            _load_sample()
+            process_incoming(app_n, snd, msg)
+
+        def _send_five():
+            for _ in range(5):
+                s = next_sample(_sample_cat(), st.session_state.get("current_sample"))
+                st.session_state["current_sample"] = s
+                if not s:
+                    break
+                pcat, _ = cat_model.predict(s["message"])
+                urg = urgency_score(s["message"])
+                mode = st.session_state.get("focus_mode_select", "Off")
+                decision = gate(mode, pcat, urg, source=s["app"])
+                if decision == "SHOW":
+                    db.add_notification(c, s["app"], s["sender"], s["message"], pcat, urg)
+                    fsess = st.session_state.get("focus_session")
+                    if fsess and fsess.get("mode") == mode and mode != "Off":
+                        fsess["shown"] = fsess.get("shown", 0) + 1
+                elif decision == "HOLD":
+                    focus_db.add_held(s["app"], s["message"], pcat, urg, mode=mode)
+                    fsess = st.session_state.get("focus_session")
+                    if fsess and fsess.get("mode") == mode and mode != "Off":
+                        fsess["held"] = fsess.get("held", 0) + 1
+                else:
+                    fsess = st.session_state.get("focus_session")
+                    if fsess and fsess.get("mode") == mode and mode != "Off":
+                        fsess["silenced"] = fsess.get("silenced", 0) + 1
+            s = st.session_state.get("current_sample")
+            if s:
+                st.session_state["in_msg"] = s["message"]
+                st.session_state["in_app"] = s["app"]
+                st.session_state["in_sender"] = s["sender"]
+            st.rerun()
+
+        st.selectbox("Sample category", ["Any"] + list(CATEGORIES), key="sample_filter")
+        st.text_input("Message", key="in_msg")
+        st.text_input("App", key="in_app")
+        st.text_input("Sender", key="in_sender")
+        cs = st.session_state.get("current_sample")
+        if cs and st.session_state.get("in_msg") == cs["message"] and st.session_state.get("in_app") == cs["app"] and st.session_state.get("in_sender") == cs["sender"]:
+            st.caption(f"Expected: {cs['category']} / {cs['urgency']}")
+        if st.session_state.get("send_warning"):
+            st.warning(st.session_state["send_warning"])
+        b1, b2, b3 = st.columns(3)
+        b1.button("Send", type="primary", width="stretch", on_click=_send_current)
+        b2.button("Shuffle", width="stretch", on_click=_load_sample)
+        b3.button("Send 5 random", width="stretch", on_click=_send_five)
+        if st.button("Random notification", width="stretch"):
+            _, a, t = random_notification()
+            process_incoming(a, "random", t)
+        st.divider()
+        st.markdown("### Demo helpers")
+        n_sim = st.slider("Simulated decisions", 20, 200, 60, 10)
+        if st.button("Train with simulated user", width="stretch"):
+            for _ in range(n_sim):
+                tc, a, t = random_notification()
+                pc, _ = cat_model.predict(t)
+                u, ts = urgency_score(t), random_time()
+                nid = db.add_notification(c, a, "sim", t, pc, u, ts)
+                db.log_choice(c, nid, pc, a, ts, u, persona_action(tc, ts.hour, u), "user")
+                db.set_status(c, nid, "snoozed")
+            st.rerun()
+        if st.button("Reset all data", width="stretch"):
+            db.reset(c); st.rerun()
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Inbox", "Reminders", "Held", "What it learned", "Chat"])
+
+    # ---------------- inbox ----------------
+    with tab1:
+        items = db.pending(c)
+        if not items:
+            st.info("Inbox zero. Send a notification from the sidebar.")
+        for n in items:
+            now = datetime.now()
+            probs, state = rec.predict(n["category"], n["app"], n["urgency"], now)
+            top = rec.best(probs)
+            ranked = sorted(probs.items(), key=lambda kv: -kv[1])[:3]
+            bars = "".join(
+                f'<div style="margin-top:8px;font-size:.82rem;font-family:var(--font-mono)">{LABELS[a]} · {p:.0%}'
+                f'<div class="bar"><div class="grow" style="--w:{p*100:.0f}%"></div></div></div>' for a, p in ranked)
+            st.markdown(
+                f'<div class="inbox-card card">'
+                f'<span class="pill mono-chip">{badge(n["category"])}</span> '
+                f'<span class="pill mono-chip">{html.escape(n["app"])}</span>'
+                f'<div class="msg">{html.escape(n["text"])}</div>'
+                f'<div class="meta">from {html.escape(n["sender"])} · urgency {n["urgency"]:.2f}</div>'
+                f'<div class="sugg"><b>Suggested: {LABELS[top]}</b> <span class="muted">({state})</span>{bars}</div></div>',
+                unsafe_allow_html=True)
+            cols = st.columns(len(ACTIONS) + 1)
+            for col, a in zip(cols, ACTIONS):
+                label = f"{LABELS[a]}"
+                btn_type = "primary" if a == top else "secondary"
+                with col:
+                    st.markdown('<div class="inbox-action">', unsafe_allow_html=True)
+                    if st.button(label, key=f"{n['id']}_{a}",
+                                 type=btn_type, width="stretch"):
+                        st.session_state["clicked_action"] = f"{n['id']}_{a}"
+                        act(n, a)
+                    st.markdown('</div>', unsafe_allow_html=True)
+            with cols[-1]:
+                st.markdown('<div class="ai-action">', unsafe_allow_html=True)
+                if st.button("Let AI decide", key=f"{n['id']}_ai", width="stretch"):
+                    st.session_state["clicked_action"] = f"{n['id']}_ai"
+                    act(n, top, source="ai")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---------------- reminders ----------------
+    with tab2:
+        rs = db.reminders(c)
+        if not rs:
+            st.info("No active reminders.")
+        for r in rs:
+            due = datetime.fromisoformat(r["due_ts"])
+            overdue = due <= datetime.now()
+            colr = "#D6336C" if overdue else "#6C5CE7"
+            a, b = st.columns([6, 1])
+            a.markdown(f'<div class="card" style="margin-top:8px;border-left:3px solid {colr};padding-left:12px">'
+                       f'<span class="pill">{"Due now" if overdue else due.strftime("%a %d %b, %H:%M")}</span>'
+                       f'<div class="msg">{html.escape(r["text"])}</div></div>', unsafe_allow_html=True)
+            if b.button("Done", key=f"done{r['id']}", width="stretch"):
+                db.complete_reminder(c, r["id"]); st.rerun()
+
+    # ---------------- held ----------------
+    with tab3:
+        held_items = focus_db.list_held()
+        if not held_items:
+            st.info("No held notifications.")
+        for h in held_items:
+            h = dict(h)
+            a, b1, b2 = st.columns([6, 1, 1])
+            a.markdown(f'<div class="card" style="margin-top:8px">'
+                       f'{badge(h.get("category",""))}'
+                       f'<span class="pill">{html.escape(str(h.get("source","")))}</span>'
+                       f'<div class="msg">{html.escape(str(h.get("text","")))}</div>'
+                       f'<div class="meta">urgency {float(h.get("urgency",0)):.2f} · {html.escape(str(h.get("created_at","")))}</div></div>',
+                       unsafe_allow_html=True)
+            if b1.button("Release", key=f"rel{h['id']}", width="stretch"):
+                focus_db.record_release_signal(h["id"])
+                focus_db.set_held_status(h["id"], "released")
+                db.add_notification(c, h.get("source", "App"), "held", h.get("text", ""), h.get("category", "social"), float(h.get("urgency", 0)))
+                st.rerun()
+            if b2.button("Dismiss", key=f"dis{h['id']}", width="stretch"):
+                focus_db.set_held_status(h["id"], "dismissed")
+                st.rerun()
+
+    # ---------------- insights ----------------
+    with tab4:
+        st.markdown("#### Focus always-allow rules")
+        rules = focus_db.list_allow_rules()
+        if rules:
+            for r in rules:
+                r = dict(r)
+                c1, c2 = st.columns([6, 1])
+                c1.write(f"{r.get('source','')} | {r.get('category','')} | {r.get('mode','')} (learned {r.get('created_at','')})")
+                if c2.button("Remove", key=f"rmrule{r['id']}"):
+                    focus_db.remove_allow_rule(r["id"])
+                    st.rerun()
+        else:
+            st.caption("No learned focus rules yet.")
+        st.divider()
+        df = db.user_choices_df(c)
+        if df.empty:
+            st.info("Make some choices, or click 'Train with simulated user', to see patterns.")
+        else:
+            st.markdown("#### Your habits: category × action")
+            st.dataframe(pd.crosstab(df["category"], df["action"]), width="stretch")
+            st.markdown("#### Average hour you act on each category")
+            st.bar_chart(df.groupby("category")["hour"].mean(), color="#6C5CE7")
+            st.markdown("#### Try it: what would it suggest?")
+            col1, col2, col3 = st.columns(3)
+            cat = col1.selectbox("Category", list(df["category"].unique()))
+            hr = col2.slider("Hour", 0, 23, 15)
+            urg = col3.slider("Urgency", 0.0, 1.0, 0.2, 0.05)
+            probs, state = rec.predict(cat, "Slack", urg, datetime.now().replace(hour=hr))
+            st.bar_chart(pd.Series({LABELS[k]: v for k, v in probs.items()}), color="#4DA3FF")
+            st.caption(state)
+
+    # ---------------- chat ----------------
+    with tab5:
+        st.markdown("#### Chat with the assistant")
+        if not st.session_state["chat_messages"]:
+            st.session_state["chat_messages"].append(
+                {"role": "assistant", "content": generate_reply("hello", now=datetime.now())}
+            )
+        for m in st.session_state["chat_messages"]:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+        if prompt := st.chat_input("Ask about notifications, reminders, focus, or what it learned"):
+            st.session_state["chat_messages"].append({"role": "user", "content": prompt})
+            reply = generate_reply(prompt, now=datetime.now())
+            st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
+            st.rerun()
+
+def render_chat():
+    st.markdown('<div class="app-header"><h2>Chat</h2><p>Ask about notifications, reminders, focus, or what it learned.</p></div>', unsafe_allow_html=True)
+    col_home, col_app = st.columns(2)
+    with col_home:
+        if st.button("Home", key="chat_home_link", width="stretch"):
+            st.session_state["page"] = "Home"
+            st.rerun()
+    with col_app:
+        if st.button("Dashboard", key="chat_app_link", width="stretch"):
+            st.session_state["page"] = "App"
+            st.rerun()
+
+    if not st.session_state["chat_messages"]:
+        st.session_state["chat_messages"].append(
+            {"role": "assistant", "content": generate_reply("hello", now=datetime.now())}
+        )
+    for m in st.session_state["chat_messages"]:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+    if prompt := st.chat_input("Ask about notifications, reminders, focus, or what it learned"):
+        st.session_state["chat_messages"].append({"role": "user", "content": prompt})
+        reply = generate_reply(prompt, now=datetime.now())
+        st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
         st.rerun()
-    if st.button("Reset all data", use_container_width=True):
-        db.reset(c); st.rerun()
 
-tab1, tab2, tab3 = st.tabs(["Inbox", "Reminders", "What it learned"])
 
-# ---------------- inbox ----------------
-with tab1:
-    items = db.pending(c)
-    if not items:
-        st.info("Inbox zero. Send a notification from the sidebar.")
-    for n in items:
-        now = datetime.now()
-        probs, state = rec.predict(n["category"], n["app"], n["urgency"], now)
-        top = rec.best(probs)
-        ranked = sorted(probs.items(), key=lambda kv: -kv[1])[:3]
-        bars = "".join(
-            f'<div style="margin-top:8px;font-size:.82rem">{LABELS[a]} · {p:.0%}'
-            f'<div class="bar"><div style="width:{p*100:.0f}%"></div></div></div>' for a, p in ranked)
-        st.markdown(
-            f'<div class="card">{badge(n["category"])}'
-            f'<span class="pill" style="color:#7A8194;background:#F1F2F7">{html.escape(n["app"])}</span>'
-            f'<div class="msg">{html.escape(n["text"])}</div>'
-            f'<div class="meta">from {html.escape(n["sender"])} · urgency {n["urgency"]:.2f}</div>'
-            f'<div class="sugg"><b>Suggested: {LABELS[top]}</b> <span style="opacity:.7">({state})</span>{bars}</div></div>',
-            unsafe_allow_html=True)
-        cols = st.columns(len(ACTIONS) + 1)
-        for col, a in zip(cols, ACTIONS):
-            if col.button(f"{LABELS[a]}", key=f"{n['id']}_{a}",
-                          type="primary" if a == top else "secondary", use_container_width=True):
-                act(n, a)
-        if cols[-1].button("Let AI decide", key=f"{n['id']}_ai", use_container_width=True):
-            act(n, top, source="ai")
-
-# ---------------- reminders ----------------
-with tab2:
-    rs = db.reminders(c)
-    if not rs:
-        st.info("No active reminders.")
-    for r in rs:
-        due = datetime.fromisoformat(r["due_ts"])
-        overdue = due <= datetime.now()
-        colr = "#D6336C" if overdue else "#6C5CE7"
-        a, b = st.columns([6, 1])
-        a.markdown(f'<div class="card" style="margin-top:8px;border-left:5px solid {colr}">'
-                   f'<span class="pill" style="color:{colr};background:#F6F4FF">{"Due now" if overdue else "" + due.strftime("%a %d %b, %H:%M")}</span>'
-                   f'<div class="msg">{html.escape(r["text"])}</div></div>', unsafe_allow_html=True)
-        if b.button("Done", key=f"done{r['id']}", use_container_width=True):
-            db.complete_reminder(c, r["id"]); st.rerun()
-
-# ---------------- insights ----------------
-with tab3:
-    df = db.user_choices_df(c)
-    if df.empty:
-        st.info("Make some choices, or click 'Train with simulated user', to see patterns.")
-    else:
-        st.markdown("#### Your habits: category × action")
-        st.dataframe(pd.crosstab(df["category"], df["action"]), use_container_width=True)
-        st.markdown("#### Average hour you act on each category")
-        st.bar_chart(df.groupby("category")["hour"].mean(), color="#6C5CE7")
-        st.markdown("#### Try it: what would it suggest?")
-        col1, col2, col3 = st.columns(3)
-        cat = col1.selectbox("Category", list(df["category"].unique()))
-        hr = col2.slider("Hour", 0, 23, 15)
-        urg = col3.slider("Urgency", 0.0, 1.0, 0.2, 0.05)
-        probs, state = rec.predict(cat, "Slack", urg, datetime.now().replace(hour=hr))
-        st.bar_chart(pd.Series({LABELS[k]: v for k, v in probs.items()}), color="#4DA3FF")
-        st.caption(state)
+init_state()
+page = st.session_state.get("page", "Home")
+if page == "Home":
+    render_home()
+elif page == "Chat":
+    render_chat()
+else:
+    render_app()
